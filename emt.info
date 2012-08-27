@@ -1,0 +1,10 @@
+name = EMT
+description = Custom module for performing API calls to ABN Groups EMT System.
+package = custom
+core = 7.x
+
+dependencies[] = libraries
+
+files[] = emt.module
+files[] = emt.webform.inc
+

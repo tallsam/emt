@@ -1,0 +1,638 @@
+<?php
+
+/**
+ * @file
+ * Drupal - EMT Integration.
+ *
+ */
+
+/**
+ * Implements hook_init().
+ */
+function emt_init() {
+  // Load referer information into session.
+  if (isset($_GET['utm_source'])) {
+    $_SESSION['emt']['utm_source'] = check_plain($_GET['utm_source']);
+  }
+  if (isset($_GET['utm_medium'])) {
+    $_SESSION['emt']['utm_medium'] = check_plain($_GET['utm_medium']);
+  }
+  if (isset($_GET['utm_campaign'])) {
+    $_SESSION['emt']['utm_campaign'] = check_plain($_GET['utm_campaign']);
+  }
+}
+
+
+/**
+ * Implements hook_node_load().
+ */
+function emt_node_load($nodes, $types) {
+  $nids = array();
+    foreach ($nodes as $node) {
+    $nids[] = $node->nid;
+  }
+
+  module_load_all_includes('webform');
+  $webform_node_types = webform_variable_get('webform_node_types');
+  //First, check to see if any of the types are the webform types to save time.
+  $is_webform = FALSE;
+  foreach ($types as $type) {
+    if (in_array($type, $webform_node_types)) {
+        $is_webform = TRUE;
+    }
+  }
+  if ($is_webform === TRUE) {
+    // Load the emt field data for this webform.
+    $result = db_query('
+      SELECT e.* FROM {emt} as e
+      WHERE e.nid IN (:nids)',
+      array(':nids' => $nids));
+
+    foreach ($result as $record) {
+      foreach ($record as $key => $value) {
+        if ($key == 'value') {
+          $value_array = unserialize($value);
+          foreach ($value_array as $value_key => $value_item)  {
+            $nodes[$record->nid]->emt['data'][$record->eid][$value_key] = $value_item;
+          }
+        }
+        else {
+          $nodes[$record->nid]->emt['data'][$record->eid][$key] = $value;
+        }
+      }
+    }
+    // Load the emt settings for this webform.
+    $result = db_query('
+      SELECT * FROM {emt_webform_settings}
+      WHERE nid IN (:nids)',
+      array(':nids' => $nids));
+
+    foreach ($result as $record) {
+      foreach($record as $key => $value) {
+        $nodes[$record->nid]->emt['settings'][$key] = $value;
+      }
+    }
+  }
+  return $nodes;
+}
+
+/**
+ * Implements hook_webform_submission_presave().
+ * Use this to send the data to EMT if it exists.
+ */
+function emt_webform_submission_presave($node, $submission) {
+  if (isset($node->emt['settings']['active']) && $node->emt['settings']['active'] == 1) {
+    // Generate the empty structured array to send to EMT.
+    $data = _emt_data_template();
+    // Header fields.
+    $data['companyID'] = variable_get('emt_companyid', '');
+    $data['leadType'] = $node->emt['settings']['lead_type'];
+    $data['formName'] = $node->emt['settings']['form_name'];
+    // Rearrange the components into an easily parsable array.
+    $webform_components = $node->webform['components'];
+    foreach($webform_components as $key => $component) {
+      $components[$component['form_key']] = $key;
+    }
+    
+    foreach ($node->emt['data'] as $field) {
+      switch ($field['type']) {
+        case 'prospect':
+        case 'reporting':
+          $cid = $components[$field['component']];
+          $data[$field['type']][$field['id']] = $submission->data[$cid]['value'][0];
+          break;
+        case 'general':
+          $cid = $components[$field['component']];
+          $data['generalFields'][] = array(
+            'item' => array(
+              'fieldName' => $field['id'], 
+              'fieldValue' => $submission->data[$cid]['value'][0]
+            )
+          );
+          break;
+        case 'reporting':
+          break;
+        case 'attribute':
+          $cid = $components[$field['component']];
+          $data['traction']['customAttributes'][] = array(
+            'itemCA' => array(
+              'fieldName' => $field['id'],
+              'fieldValue' => ($field['component_or_custom'] == 1) ? $field['custom'] : $submission->data[$cid]['value'][0],
+              'fieldType' => $field['traction_attribute_type'],
+            )
+          );
+          break;
+        case 'interaction':
+          $cid = $components[$field['extra_info_component']];
+          $data['traction']['interactions'][] = array(
+            'interact' => array(
+              'functionID' => $field['function_id'],
+              'interactionID' => $field['id'],
+              'extraInfo' => ($field['component_or_custom'] == 1) ? $field['extra_info_custom'] : $submission->data[$cid]['value'][0],
+            ),
+          );
+          break;
+        case 'optin':
+          $cid = $components[$field['component']];
+          if (!isset($submission->data[$cid]['value'][0])) {
+            // Webform sends NULL through sometimes.
+            $submission->data[$cid]['value'][0] = 0;
+          }
+          $data['traction']['optin'] = ($field['component_or_custom'] == 1) ? $field['custom'] : $submission->data[$cid]['value'][0];
+          break;
+      }
+    }
+
+    // Referer data.
+    if (isset($_SESSION['emt']['utm_source'])) {
+      $data['referer']['source'] = $_SESSION['emt']['utm_source'];
+      $data['reporting']['refererSource'] = $_SESSION['emt']['utm_source'];
+    }
+    if (isset($_SESSION['emt']['utm_medium'])) {
+      $data['referer']['medium'] = $_SESSION['emt']['utm_medium'];
+      $data['reporting']['refererMedium'] = $_SESSION['emt']['utm_medium'];
+    }
+    if (isset($_SESSION['emt']['utm_campaign'])) {
+      $data['referer']['campaign'] = $_SESSION['emt']['utm_campaign'];
+      $data['reporting']['refererCampaign'] = $_SESSION['emt']['utm_campaign'];
+    }
+
+    // Send the data to EMT.
+    $node->emt['response'] = emt_post($data);
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function emt_node_delete($node) {
+  module_load_all_includes('webform');
+  $webform_node_types = webform_variable_get('webform_node_types');
+  if (in_array($node->type, $webform_node_types)) {
+    $result = db_delete('emt_webform_settings')
+      ->condition('nid', $node->nid)
+      ->execute();
+    $result = db_delet('emt')
+      ->condition('nid', $node->nid)
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function emt_menu() {
+  $items = array();
+
+  // Site-wide configuration.
+  $items['admin/config/services/emt'] = array(
+    'title' => 'EMT configuration',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_settings_form'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer emt'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['node/%webform_menu/webform/emt_settings'] = array(
+    'title' => 'EMT settings',
+    'load arguments' => array(1),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_settings_form', 1),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer emt'),
+    'file' => 'emt.webform.inc',
+    'weight' => 1,
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  // Field List.
+  $items['node/%webform_menu/webform/emt'] = array(
+    'title' => 'EMT fields',
+    'load arguments' => array(1),
+    'page callback' => 'emt_webform_table',
+    'page arguments' => array(1),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer emt'),
+    'file' => 'emt.webform.inc',
+    'weight' => 2,
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  // Prospect Fields.
+  $items['node/%webform_menu/webform/emt/prospect/add'] = array(
+    'title' => 'Add Prospect Field',
+    'load arguments' => array(1),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_prospect_form', 1),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer emt'),
+    'file' => 'emt.webform.inc',
+    'weight' => 1,
+  );
+
+  $items['node/%webform_menu/webform/emt/prospect/%/edit'] = array(
+    'title' => 'Edit Prospect Field',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_prospect_form',1,5),
+    'access arguments' => array('administer emt'),
+    'access callback' => 'user_access',
+    'file' => 'emt.webform.inc',
+    'weight' => 2,
+  );
+
+  // Reporting Fields.
+  $items['node/%webform_menu/webform/emt/reporting/add'] = array(
+    'title' => 'Add Reporting Field',
+    'load arguments' => array(1),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_reporting_form', 1),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer emt'),
+    'file' => 'emt.webform.inc',
+    'weight' => 1,
+  );
+
+  $items['node/%webform_menu/webform/emt/reporting/%/edit'] = array(
+    'title' => 'Edit Reporting Field',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_reporting_form',1,5),
+    'access arguments' => array('administer emt'),
+    'access callback' => 'user_access',
+    'file' => 'emt.webform.inc',
+    'weight' => 2,
+  );
+  
+  // Optin Field.
+  $items['node/%webform_menu/webform/emt/optin/add'] = array(
+    'title' => 'Add Reporting Field',
+    'load arguments' => array(1),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_optin_form', 1),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer emt'),
+    'file' => 'emt.webform.inc',
+    'weight' => 1,
+  );
+
+  $items['node/%webform_menu/webform/emt/optin/%/edit'] = array(
+    'title' => 'Edit Reporting Field',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_optin_form',1,5),
+    'access arguments' => array('administer emt'),
+    'access callback' => 'user_access',
+    'file' => 'emt.webform.inc',
+    'weight' => 2,
+  );
+
+  // General Fields.
+  $items['node/%webform_menu/webform/emt/general/add'] = array(
+    'title' => 'Add General Field',
+    'load arguments' => array(1),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_general_form', 1),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer emt'),
+    'file' => 'emt.webform.inc',
+    'weight' => 1,
+    'file' => 'emt.webform.inc',
+  );  
+  $items['node/%webform_menu/webform/emt/general/%/edit'] = array(
+    'title' => 'Edit General Field',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_general_form',1,5),
+    'access arguments' => array('administer emt'),
+    'access callback' => 'user_access',
+    'file' => 'emt.webform.inc',
+  );
+
+  // Traction Attribute Fields.
+  $items['node/%webform_menu/webform/emt/attribute/add'] = array(
+    'title' => 'Add Traction Attribute',
+    'load arguments' => array(1),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_attribute_form', 1),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer emt'),
+    'weight' => 1,
+    'file' => 'emt.webform.inc',
+  );  
+  $items['node/%webform_menu/webform/emt/attribute/%/edit'] = array(
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_attribute_form',1,5),
+    'title' => 'Edit Traction Attribute',
+    'access arguments' => array('administer emt'),
+    'access callback' => 'user_access',
+    'file' => 'emt.webform.inc',
+  );
+
+  // Traction Interaction Fields.
+  $items['node/%webform_menu/webform/emt/interaction/add'] = array(
+    'title' => 'Add Traction Interaction',
+    'load arguments' => array(1),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_interaction_form', 1),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer emt'),
+    'weight' => 1,
+    'file' => 'emt.webform.inc',
+  );  
+  $items['node/%webform_menu/webform/emt/interaction/%/edit'] = array(
+    'title' => 'Edit Traction Interaction',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('emt_webform_interaction_form',1,5),
+    'access arguments' => array('administer emt'),
+    'access callback' => 'user_access',
+    'file' => 'emt.webform.inc',
+  );
+
+  // Delete field.
+  $items['node/%/webform/emt/%/delete'] = array(
+    'page callback' => 'emt_webform_field_delete',
+    'page arguments' => array(1,4),
+    'access arguments' => array('administer emt'),
+    'access callback' => 'user_access',
+    'file' => 'emt.webform.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function emt_permission() {
+  return array(
+    'administer emt' => array(
+      'title' => t('Administer EMT Settings'),
+      'description' => t('Perform administration tasks for EMT module'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_theme() {
+ */
+function emt_theme() {
+  return array(
+    'emt_webform_settings' => array(
+      'variables' => array('rows' => NULL),
+      'file' => 'templates/emt-webform-settings.tpl.php',
+    ),
+  );
+}
+
+/**
+ * Accepts a structured array and sends it to EMT.
+ * See README for an example of the array structure.
+ */
+function emt_post($data, $debug = 0) {
+  // Build the URL to post to.
+  $url = variable_get('emt_post_url', '');
+  if ($url == '') {
+    drupal_set_message('You need to set the POST URL at Configuration -> Web services -> EMT configuration');
+    return 0;
+  }
+
+  // Convert the array to the XML.
+  // Header copied from the example PHP code.
+  $wrapper = '<?xml version="1.0" encoding="UTF-8"?><lead xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="EMT.xsd"></lead>';
+  $xml = new SimpleXMLElement($wrapper);
+  _emt_array_to_xml($data, $xml);
+  $string = $xml->asXML();
+  if ($debug) {
+    dsm($string);
+  }
+
+  // Prepare and send the request.
+  // Using nusoap as thats what the example PHP code uses.
+  module_load_include('php', 'emt', 'lib/nusoap/nusoap');
+  $client = new nusoap_client($url, TRUE);
+  $err = $client->getError();
+  if ($err) {
+    watchdog('emt', 'Could not connect to EMTWebservices: %url', array('%url' => $url));
+  }
+  $client->debug_flag = 1;
+  $params = array('strData' => stripslashes($string));
+  if (!$debug) {
+    $response = $client->call("ImportEMTData", $params);
+    if ($client->fault) {
+      watchdog('emt', 'EMT SOAP Fault: %response', array('response' => $client->fault));
+    }
+    else {
+      $err = $client->getError();
+      if (!empty($err)) {
+        watchdog('emt', 'EMT SOAP Error: %err', array('%err' => $err, ));
+      }
+      else {
+        watchdog('emt', 'EMT Post Success: %string ', array('%string' => $string));
+        return $response;
+      }
+    }
+  }
+  return 0;
+}
+
+/**
+ * FAPI for EMT settings form.
+ */
+function emt_settings_form() {
+  $form['emt_post_url'] = array(
+    '#type' => 'textfield',
+    '#title' => 'POST URL',
+    '#required' => TRUE,
+    '#attributes' => array(
+      'class' => array(
+        'textfield', 'emt_post_url',
+      )
+    ),
+    '#default_value' => variable_get('emt_post_url', ''),
+    '#description' => 'The URL that the forms will send data to. ie \'https://emt.abngroup.com.au/EMTWebservices.asmx?wsdl\'',
+  );
+  $form['emt_companyid'] = array(
+    '#type' => 'textfield',
+    '#title' => 'Company ID',
+    '#required' => TRUE,
+    '#attributes' => array(
+      'class' => array(
+        'textfield', 'emt_companyid',
+      ),
+    ),
+    '#default_value' => variable_get('emt_companyid', ''),
+    '#description' => 'The company id as required by EMT',
+  );
+  return system_settings_form($form);
+}
+
+/**
+ * Recursive function to convert array to XML.
+ * Note that PHP associative arrays must have unique names,
+ * so we wrap items with the same name in numerical arrays.
+ * See: http://stackoverflow.com/a/5965940
+ */
+function _emt_array_to_xml($data, &$xml) {
+  foreach($data as $key => $value) {
+    if(is_array($value)) {
+      if(!is_numeric($key)) {
+        $subnode = $xml->addChild("$key");
+        _emt_array_to_xml($value, $subnode);
+      }
+      else {
+        _emt_array_to_xml($value, $xml);
+      }
+    }
+    else {
+      $clean = htmlentities($value);
+      $xml->addChild("$key", $clean);
+    }
+  }
+}
+
+/**
+ * Returns the avaiable EMT lead types.
+ */
+function _emt_leadtype_options() {
+  return array(
+    'enquiry' => 'Enquiry',
+    'lead' => 'Lead',
+  );
+}
+
+/**
+ * Returns the fields EMT recognises.
+ */
+function _emt_prospect_field_options() {
+  return array(
+    0 => '-- Do Not Map to EMT --',
+    'firstname' => 'First Name',
+    'lastname' => 'Last Name',
+    'email' => 'Email',
+    'email2' => 'Email 2',
+    'phone' => 'Phone',
+    'phone2' => 'Phone 2',
+    'mobile' => 'Mobile',
+    'mobile2' => 'Mobile 2',
+  );
+}
+
+/**
+ * Returns an empty structured array useful for sending to EMT.
+ */
+function _emt_data_template() {
+  $data = array(
+    'companyID' => '',
+    'leadType' => '',
+    'formName' => '',
+    'referer' => array(
+      'source' => '',
+      'medium' => '',
+      'campaign' => '',
+    ),
+    'prospect' => array(
+      'firstname' => '',
+      'lastname' => '',
+      'email' => '',
+      'email2' => '',
+      'phone' => '',
+      'phone2' => '',
+      'mobile' => '',
+      'mobile2' => '',
+    ),
+    'reporting' => array(
+      'homeName' => '',
+      'buildLocation' => '',
+      'housePrice' => '',
+      'houselandSuburb' => '',
+      'houselandPrice' => '',
+      'refererSource' => '',
+      'refererMedium' => '',
+      'refererCampaign' => '',
+    ),
+    'generalFields' => array(
+      /*
+      array(
+        'item' => array(
+        'fieldName' => '',
+        'fieldValue' => '',
+       ),
+      ),
+      */
+    ),
+    'traction' => array(
+      'optin' => '',
+      'customAttributes' => array(
+        /*
+        array(
+          'itemCA' => array(
+            'fieldName' => '2999048',
+            'fieldValue' => 'Y',
+            'fieldType' => '8',
+          ),  
+        ),
+        */  
+      ),
+      'interactions' => array(
+        /*
+        array(
+          'interact' => array(
+            'functionID' => 0,
+            'interactionID' => 10561,
+            'extraInfo' => 'What to Look For When Choosing 2012-05-08 18:15:00',
+          ),
+        ),
+         */
+      ),
+    ),
+  );
+  return $data;
+}
+
+/**
+ * Grabs the component ids and names from a webform node object.
+ */
+function _emt_get_components($node) {
+  if(isset($node->webform['components'])) {
+    $components = array();
+    foreach ($node->webform['components'] as $component) {
+      $components[$component['form_key']] = $component['name'];
+    }
+    return $components;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Load an emt field based on eid.
+ */
+function  _emt_load_field($eid) {
+  $result = db_query("SELECT * FROM {emt} WHERE eid = :eid", array('eid' => $eid));
+  $record = $result->fetchAssoc();
+  $record['value'] = unserialize($record['value']);
+  foreach ($record['value'] as $key => $element) {
+    $record[$key] = $element;
+  }
+  unset($record['value']);
+  return $record;
+}
+
+/**
+ * Return an array of traction attribute types.
+ */
+function _emt_get_traction_types() {
+  return array(
+    8 => 'Boolean',
+    1 => 'Date',
+    3 => 'DateOfBirth',
+    2 => 'DateTime',            
+    13 => 'File',
+    12 => 'List',
+    10 => 'MultiList',
+    4 => 'Number',      
+    9 => 'OptStatus',
+    0 => 'Text',                
+    11 => 'TextArea',
+    12 => 'List',
+  );
+}
